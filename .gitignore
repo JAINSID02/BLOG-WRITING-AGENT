@@ -1,0 +1,7 @@
+.env
+bwaenv/
+
+__pycache__/
+*.pyc
+
+test.ipynb
