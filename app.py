@@ -1,351 +1,515 @@
-from __future__ import annotations
-import operator
-from typing import TypedDict, List , Annotated , Literal ,Optional
-import os
-from pydantic import BaseModel , Field
-from langgraph.graph import StateGraph , START , END
-from langgraph.types import Send
-import re
-from langchain_mistralai import ChatMistralAI
-from langchain_core.messages import SystemMessage , HumanMessage
-from dotenv import load_dotenv
-from langchain_community.tools.tavily_search import TavilySearchResults
-load_dotenv()
-
-class Task(BaseModel):
-    id: int 
-    title: str
-    goal: str =Field(... , description ="One sentence describing what the reader should be able to do/understand after this section")
-    bullets :List[str]=Field(...,min_length =3,
-                             max_length=5,
-                             description="3 - 5 concrete, non-overlapping subpoints to cover in this section.")  
-    target_words:int=Field(...,description="Target word count for this section (120 -  450)")
-    tags:List[str]=Field(default_factory=list)
-    requires_research:bool=False
-    requires_citations:bool=False
-    requires_code:bool=False
-
-
-class Plan(BaseModel):
-    blog_title:str
-    audience:str=Field(...,description="Who is this blog for")
-    tone:str=Field(...,description="Writing tone (e.g., practical, crisp).")
-    blog_kind:Literal["explainer", "tutorial", "news_roundup", "comparison", "system_design"]="explainer"
-    constraints:List[str]=Field(default_factory=list)
-    tasks:List[Task]
-
-class EvidenceItem(BaseModel):
-     title:str
-     url:str
-     published_at:Optional[str]= None
-     snippet:Optional[str] = None
-     source : Optional[str] = None
-
-
-class RouterDecision(BaseModel):
-     needs_research:bool
-     mode:Literal["closed_book","hybrid","open_book"]
-     queries:List[str]=Field(default_factory=list)
-
-class EvidencePack(BaseModel):
-     evidence:List[EvidenceItem]=Field(default_factory=list)
-
-class State(TypedDict):
-    topic:str
-
-    mode :str
-    needs_research:bool
-    queries:List[str]
-    evidence:List[EvidenceItem]
-    plan:Optional[Plan]
-    sections :Annotated[List[tuple[int,str]],operator.add]
-    final:str
-
-llm = ChatMistralAI(model="mistral-small-latest", mistral_api_key=os.getenv("MISTRAL_API_KEY"))
-
-Router_System="""You are a routing module for a technical blog planner.
-
-Decide whether web research is needed BEFORE planning.
-
-Modes:
-- closed_book (needs_research=false):
-  Evergreen topics where correctness does not depend on recent facts (concepts, fundamentals).
-- hybrid (needs_research=true):
-  Mostly evergreen but needs up-to-date examples/tools/models to be useful.
-- open_book (needs_research=true):
-  Mostly volatile: weekly roundups, "this week", "latest", rankings, pricing, policy/regulation.
-
-If needs_research=true:
-- Output 3 - 10 high-signal queries.
-- Queries should be scoped and specific (avoid generic queries like just "AI" or "LLM").
-- If user asked for "last week/this week/latest", reflect that constraint IN THE QUERIES."""
-
-def router_node(state: State) -> dict:
-    topic = state["topic"]
-
-    decider = llm.with_structured_output(RouterDecision)
-
-    decision = decider.invoke([
-        SystemMessage(content=Router_System),
-        HumanMessage(content=f"Topic: {topic}")
-    ])
-
-    return {
-        "needs_research": decision.needs_research,
-        "mode" : decision.mode,
-        "queries" : decision.queries
-    }
-
-def route_next(state:State)->str:
-     return "research" if state["needs_research"] else "orchestration"
-
-def _tavily_search(query:str , max_results:int = 5)->list[dict]:
-     
-     
-     tool=TavilySearchResults(max_results=max_results)
-     results=tool.invoke({"query":query})
-
-     normalized:List[dict]=[]
-
-     for r in results or []:
-          normalized.append({
-               "title":r.get("title") or "",
-               "url":r.get("url") or "",
-               "snippet":r.get("content") or r.get("snippet") or "",
-               "published_at":r.get("published_date") or r.get("published_at"),
-               "source":r.get("source")
-
-
-          })
-
-     return normalized 
-
-
-RESEARCH_SYSTEM = """You are a research synthesizer for technical writing.
-
-Given raw web search results, produce a deduplicated list of EvidenceItem objects.
-
-Rules:
-- Only include items with a non-empty url.
-- Prefer relevant + authoritative sources (company blogs, docs, reputable outlets).
-- If a published date is explicitly present in the result payload, keep it as YYYY-MM-DD.
-  If missing or unclear, set published_at=null. Do NOT guess.
-- Keep snippets short.
-- Deduplicate by URL."""
-
-
-def research_node(state:State)->dict:
-     queries = (state.get("queries",[]) or [])
-     max_results= 5 
-
-     raw_results:List[dict] = []
-
-     for q in queries:
-          raw_results.extend(_tavily_search(q,max_results=max_results))
-     if not raw_results :
-          return {"evidence":[]}
-     
-     extractor=llm.with_structured_output(EvidencePack)
-     pack=extractor.invoke([
-            SystemMessage(content=RESEARCH_SYSTEM),
-            HumanMessage(content=f"Raw results:\n{raw_results}"),
-        ])
-     
-     dedup={}
-
-     for e in pack.evidence:
-          if e.url:
-               dedup[e.url]=e
-
-     return {"evidence":list(dedup.values())}
-
-
-ORCH_SYSTEM=""""You are a senior technical writer and developer advocate.
-Your job is to produce a highly actionable outline for a technical blog post.
-
-Hard requirements:
-- Create 5–9 sections (tasks) suitable for the topic and audience.
-- Each task must include:
-  1) goal (1 sentence)
-  2) 3–6 bullets that are concrete, specific, and non-overlapping
-  3) target word count (120–550)
-
-Quality bar:
-- Assume the reader is a developer; use correct terminology.
-- Bullets must be actionable: build/compare/measure/verify/debug.
-- Ensure the overall plan includes at least 2 of these somewhere:
-  * minimal code sketch / MWE (set requires_code=True for that section)
-  * edge cases / failure modes
-  * performance/cost considerations
-  * security/privacy considerations (if relevant)
-  * debugging/observability tips
-
-Grounding rules:
-- Mode closed_book: keep it evergreen; do not depend on evidence.
-- Mode hybrid:
-  - Use evidence for up-to-date examples (models/tools/releases) in bullets.
-  - Mark sections using fresh info as requires_research=True and requires_citations=True.
-- Mode open_book:
-  - Set blog_kind = "news_roundup".
-  - Every section is about summarizing events + implications.
-  - DO NOT include tutorial/how-to sections unless user explicitly asked for that.
-  - If evidence is empty or insufficient, create a plan that transparently says "insufficient sources"
-    and includes only what can be supported.
-
-Output must strictly match the Plan schema."""
-
-
-
-def orchestrator_node(state:State)->dict:
-    planner=llm.with_structured_output(Plan)
-    evidence = state.get("evidence",[])
-    mode=state.get("mode","closed_book")
-    plan=planner.invoke([
-            SystemMessage(content=ORCH_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"Topic: {state['topic']}\n"
-                    f"Mode: {mode}\n\n"
-                    f"Evidence (ONLY use for fresh claims; may be empty):\n"
-                    f"{[e.model_dump() for e in evidence][:16]}"
-                )
-            ),
-        ])
-    return {"plan":plan}
-
-
-
-
-
-def fanout(state:State):
-        return [Send("worker",{"task":task.model_dump(),
-                               "topic":state["topic"],
-                               "mode":state["mode"],
-                               "plan":state["plan"].model_dump(),
-                               "evidence":[e.model_dump() for e in state.get("evidence",[])]
-                               }
-                               )
-
-                for task in state["plan"].tasks]
-
-
-WORKER_SYSTEM ="""You are a senior technical writer and developer advocate.
-Write ONE section of a technical blog post in Markdown.
-
-Hard constraints:
-- Follow the provided Goal and cover ALL Bullets in order (do not skip or merge bullets).
-- Stay close to Target words (±15%).
-- Output ONLY the section content in Markdown (no blog title H1, no extra commentary).
-- Start with a '## <Section Title>' heading.
-
-Scope guard:
-- If blog_kind == "news_roundup": do NOT turn this into a tutorial/how-to guide.
-  Do NOT teach web scraping, RSS, automation, or "how to fetch news" unless bullets explicitly ask for it.
-  Focus on summarizing events and implications.
-
-Grounding policy:
-- If mode == open_book:
-  - Do NOT introduce any specific event/company/model/funding/policy claim unless it is supported by provided Evidence URLs.
-  - For each event claim, attach a source as a Markdown link: ([Source](URL)).
-  - Only use URLs provided in Evidence. If not supported, write: "Not found in provided sources."
-- If requires_citations == true:
-  - For outside-world claims, cite Evidence URLs the same way.
-- Evergreen reasoning is OK without citations unless requires_citations is true.
-
-Code:
-- If requires_code == true, include at least one minimal, correct code snippet relevant to the bullets.
-
-Style:
-- Short paragraphs, bullets where helpful, code fences for code.
-- Avoid fluff/marketing. Be precise and implementation-oriented."""
-
-
-def worker_node(payload:dict)->dict:
-     task=Task(**payload["task"])
-     plan=Plan(**payload["plan"])
-     evidence=[EvidenceItem(**e) for e in payload.get("evidence",[]) ]
-     topic=payload["topic"]
-     mode=payload.get("mode","closed_book")
-
-     bullets_text="\n- " + "\n- ".join(task.bullets)
-
-     evidence_text=""
-     if evidence:
-          evidence_text="\n".join(
-               f"{e.title} | {e.url} | {e.published_at or 'date:unknown' }".strip()
-               for e in evidence[:20]
-          )
-     section_md=llm.invoke([
-            SystemMessage(content=WORKER_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"Blog title: {plan.blog_title}\n"
-                    f"Audience: {plan.audience}\n"
-                    f"Tone: {plan.tone}\n"
-                    f"Blog kind: {plan.blog_kind}\n"
-                    f"Constraints: {plan.constraints}\n"
-                    f"Topic: {topic}\n"
-                    f"Mode: {mode}\n\n"
-                    f"Section title: {task.title}\n"
-                    f"Goal: {task.goal}\n"
-                    f"Target words: {task.target_words}\n"
-                    f"Tags: {task.tags}\n"
-                    f"requires_research: {task.requires_research}\n"
-                    f"requires_citations: {task.requires_citations}\n"
-                    f"requires_code: {task.requires_code}\n"
-                    f"Bullets:{bullets_text}\n\n"
-                    f"Evidence (ONLY use these URLs when citing):\n{evidence_text}\n"
-                )
-            ),
-        ]).content.strip()
-     
-     return{"sections":[(task.id , section_md)]}
-
+import streamlit as st
+import sys, io, re
 from pathlib import Path
-def reducer_node(state:State )->dict:
-     plan=state["plan"]
-     ordered_sections = [md for _,md in sorted(state["sections"],key=lambda x:x [0])]
-     body="\n\n".join(ordered_sections).strip()
-     final_md = f"#{plan.blog_title}\n\n{body}\n"
 
-     filename = re.sub(r'[<>:"/\\|?*]', "", plan.blog_title)
-     filename = filename.lower().replace(" ", "_") + ".md"
-     output_path=Path(filename)
-     output_path.write_text(final_md,encoding="utf-8")
-     return{"final":final_md}
+st.set_page_config(
+    page_title="BlogForge",
+    page_icon="✦",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
-g=StateGraph(State)
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=DM+Serif+Display&display=swap');
 
-g.add_node("router",router_node)
-g.add_node("research",research_node)
-g.add_node("orchestrator",orchestrator_node)
-g.add_node("worker",worker_node)
-g.add_node("reducer",reducer_node)
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-g.add_edge(START , "router")
-g.add_conditional_edges("router" , route_next,{"research":"research","orchestrator":"orchestrator"})
-g.add_edge("research" , "orchestrator")
-g.add_conditional_edges("orchestrator" ,fanout , ["worker"])
-g.add_edge("worker" , "reducer")
-g.add_edge("reducer" , END)
+html, body, [data-testid="stAppViewContainer"],
+[data-testid="stMain"], .main, .block-container {
+    background: #0a0a0a !important;
+    color: #f0f0f0 !important;
+    font-family: 'Inter', sans-serif !important;
+}
+
+[data-testid="stSidebar"],
+[data-testid="stToolbar"],
+[data-testid="stDecoration"],
+footer, #MainMenu { display: none !important; visibility: hidden !important; }
+
+.block-container {
+    max-width: 900px !important;
+    padding: 3rem 2rem 6rem !important;
+    margin: 0 auto !important;
+}
+
+/* ── HEADER ──────────────────────────────────────────────── */
+.bf-header {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    padding-bottom: 2rem;
+    border-bottom: 1px solid #1e1e1e;
+    margin-bottom: 3rem;
+}
+.bf-wordmark {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.bf-logo {
+    width: 32px; height: 32px;
+    background: #f0f0f0;
+    border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px; color: #0a0a0a; font-weight: 700;
+    font-family: 'DM Serif Display', serif;
+    flex-shrink: 0;
+}
+.bf-brand {
+    font-family: 'DM Serif Display', serif;
+    font-size: 1.25rem;
+    color: #f0f0f0;
+    letter-spacing: -0.3px;
+}
+.bf-tagline {
+    font-size: 0.7rem;
+    color: #555;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    font-weight: 500;
+}
+
+/* ── HERO ────────────────────────────────────────────────── */
+.bf-hero {
+    margin-bottom: 2.5rem;
+}
+.bf-hero-eyebrow {
+    font-size: 0.7rem;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    color: #555;
+    margin-bottom: 0.75rem;
+}
+.bf-hero-title {
+    font-family: 'DM Serif Display', serif;
+    font-size: clamp(2rem, 5vw, 3rem);
+    line-height: 1.1;
+    color: #f0f0f0;
+    letter-spacing: -1px;
+    margin-bottom: 0.75rem;
+}
+.bf-hero-sub {
+    font-size: 0.9rem;
+    color: #666;
+    line-height: 1.6;
+    max-width: 540px;
+}
+
+/* ── INPUT SECTION ───────────────────────────────────────── */
+.bf-input-label {
+    font-size: 0.7rem;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: #555;
+    margin-bottom: 0.6rem;
+}
+
+.stTextInput > div > div > input {
+    background: #111111 !important;
+    border: 1px solid #2a2a2a !important;
+    border-radius: 10px !important;
+    color: #f0f0f0 !important;
+    font-family: 'Inter', sans-serif !important;
+    font-size: 0.95rem !important;
+    padding: 0.85rem 1.1rem !important;
+    transition: border-color 0.15s !important;
+    box-shadow: none !important;
+    height: auto !important;
+}
+.stTextInput > div > div > input:focus {
+    border-color: #f0f0f0 !important;
+    box-shadow: 0 0 0 3px rgba(240,240,240,0.06) !important;
+    outline: none !important;
+}
+.stTextInput > div > div > input::placeholder { color: #444 !important; }
+div[data-testid="stWidgetLabel"] > label,
+div[data-testid="stWidgetLabel"] p { display: none !important; }
+
+/* ── GENERATE BUTTON ─────────────────────────────────────── */
+div[data-testid="stButton"] > button {
+    background: #f0f0f0 !important;
+    color: #0a0a0a !important;
+    border: none !important;
+    border-radius: 10px !important;
+    font-family: 'Inter', sans-serif !important;
+    font-size: 0.82rem !important;
+    font-weight: 600 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.1em !important;
+    padding: 0.75rem 2rem !important;
+    width: 100% !important;
+    cursor: pointer !important;
+    transition: opacity 0.15s, transform 0.1s !important;
+}
+div[data-testid="stButton"] > button:hover {
+    opacity: 0.85 !important;
+    transform: translateY(-1px) !important;
+}
+div[data-testid="stButton"] > button:active {
+    transform: translateY(0) !important;
+}
+
+/* ── METRIC CARDS ────────────────────────────────────────── */
+[data-testid="stMetric"] {
+    background: #111111 !important;
+    border: 1px solid #1e1e1e !important;
+    border-radius: 12px !important;
+    padding: 1rem 1.25rem !important;
+}
+[data-testid="stMetricLabel"] > div {
+    font-size: 0.68rem !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.1em !important;
+    color: #555 !important;
+    font-weight: 500 !important;
+}
+[data-testid="stMetricValue"] > div {
+    font-size: 1.5rem !important;
+    font-weight: 600 !important;
+    color: #f0f0f0 !important;
+    font-family: 'Inter', sans-serif !important;
+}
+[data-testid="stMetricDelta"] { display: none !important; }
+
+/* ── STATUS / SPINNER ────────────────────────────────────── */
+.bf-status {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: #111;
+    border: 1px solid #1e1e1e;
+    border-radius: 10px;
+    padding: 0.9rem 1.2rem;
+    font-size: 0.82rem;
+    color: #888;
+    font-family: 'Inter', monospace;
+    margin: 1rem 0;
+}
+.bf-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: #f0f0f0;
+    animation: pulse 1.2s ease-in-out infinite;
+    flex-shrink: 0;
+}
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.2; }
+}
+.bf-done-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: #4caf50;
+    flex-shrink: 0;
+}
+
+/* ── OUTPUT AREA ─────────────────────────────────────────── */
+.bf-output-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 1.25rem 0 0.75rem;
+    border-top: 1px solid #1e1e1e;
+    margin-top: 2rem;
+}
+.bf-output-label {
+    font-size: 0.7rem;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: #555;
+}
+
+/* ── TABS ────────────────────────────────────────────────── */
+[data-testid="stTabs"] [role="tablist"] {
+    background: #111 !important;
+    border: 1px solid #1e1e1e !important;
+    border-radius: 10px !important;
+    padding: 4px !important;
+    gap: 2px !important;
+}
+[data-testid="stTabs"] button[role="tab"] {
+    background: transparent !important;
+    border: none !important;
+    border-radius: 7px !important;
+    color: #555 !important;
+    font-size: 0.78rem !important;
+    font-weight: 500 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.08em !important;
+    padding: 0.45rem 1.2rem !important;
+    transition: all 0.15s !important;
+}
+[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+    background: #1e1e1e !important;
+    color: #f0f0f0 !important;
+}
+[data-testid="stTabs"] [data-testid="stTabContent"] {
+    background: #111 !important;
+    border: 1px solid #1e1e1e !important;
+    border-radius: 0 0 12px 12px !important;
+    border-top: none !important;
+    padding: 1.5rem 1.75rem !important;
+    margin-top: -1px !important;
+}
+
+/* ── MARKDOWN CONTENT ────────────────────────────────────── */
+[data-testid="stTabContent"] .stMarkdown h1 {
+    font-family: 'DM Serif Display', serif !important;
+    font-size: 1.8rem !important;
+    font-weight: 400 !important;
+    color: #f0f0f0 !important;
+    letter-spacing: -0.5px !important;
+    margin-bottom: 1.5rem !important;
+    padding-bottom: 1rem !important;
+    border-bottom: 1px solid #1e1e1e !important;
+}
+[data-testid="stTabContent"] .stMarkdown h2 {
+    font-size: 1.1rem !important;
+    font-weight: 600 !important;
+    color: #f0f0f0 !important;
+    margin-top: 2rem !important;
+    margin-bottom: 0.75rem !important;
+}
+[data-testid="stTabContent"] .stMarkdown h3 {
+    font-size: 0.95rem !important;
+    font-weight: 600 !important;
+    color: #ccc !important;
+}
+[data-testid="stTabContent"] .stMarkdown p {
+    line-height: 1.75 !important;
+    color: #bbb !important;
+    font-size: 0.9rem !important;
+    margin-bottom: 0.9rem !important;
+}
+[data-testid="stTabContent"] .stMarkdown ul,
+[data-testid="stTabContent"] .stMarkdown ol {
+    padding-left: 1.5rem !important;
+}
+[data-testid="stTabContent"] .stMarkdown li {
+    color: #bbb !important;
+    font-size: 0.9rem !important;
+    line-height: 1.7 !important;
+    margin-bottom: 0.3rem !important;
+}
+[data-testid="stTabContent"] .stMarkdown code {
+    background: #1a1a1a !important;
+    color: #e0e0e0 !important;
+    font-size: 0.82rem !important;
+    padding: 0.15em 0.4em !important;
+    border-radius: 4px !important;
+    font-family: 'SF Mono', 'Fira Code', monospace !important;
+}
+[data-testid="stTabContent"] .stMarkdown pre {
+    background: #0f0f0f !important;
+    border: 1px solid #1e1e1e !important;
+    border-left: 3px solid #f0f0f0 !important;
+    border-radius: 10px !important;
+    padding: 1.25rem 1.5rem !important;
+    overflow-x: auto !important;
+    margin: 1rem 0 !important;
+}
+[data-testid="stTabContent"] .stMarkdown pre code {
+    background: transparent !important;
+    padding: 0 !important;
+    font-size: 0.82rem !important;
+    color: #ccc !important;
+}
+[data-testid="stTabContent"] .stMarkdown blockquote {
+    border-left: 3px solid #2a2a2a !important;
+    padding-left: 1rem !important;
+    color: #666 !important;
+    font-style: italic !important;
+}
+[data-testid="stTabContent"] .stMarkdown a {
+    color: #f0f0f0 !important;
+    text-decoration: underline !important;
+    text-underline-offset: 2px !important;
+}
+
+/* ── CODE BLOCK (raw tab) ─────────────────────────────────── */
+[data-testid="stTabContent"] [data-testid="stCode"] {
+    background: #0f0f0f !important;
+    border: 1px solid #1e1e1e !important;
+    border-radius: 10px !important;
+}
+[data-testid="stTabContent"] [data-testid="stCode"] pre {
+    background: transparent !important;
+    border: none !important;
+    border-radius: 0 !important;
+    font-size: 0.8rem !important;
+    color: #999 !important;
+}
+
+/* ── DOWNLOAD BUTTON ─────────────────────────────────────── */
+[data-testid="stDownloadButton"] > button {
+    background: transparent !important;
+    color: #f0f0f0 !important;
+    border: 1px solid #2a2a2a !important;
+    border-radius: 10px !important;
+    font-family: 'Inter', sans-serif !important;
+    font-size: 0.78rem !important;
+    font-weight: 500 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.1em !important;
+    padding: 0.65rem 1.5rem !important;
+    transition: background 0.15s, border-color 0.15s !important;
+}
+[data-testid="stDownloadButton"] > button:hover {
+    background: #1a1a1a !important;
+    border-color: #555 !important;
+}
+
+/* ── DIVIDER ─────────────────────────────────────────────── */
+hr { border: none !important; border-top: 1px solid #1e1e1e !important; margin: 2rem 0 !important; }
+
+/* ── ERROR ───────────────────────────────────────────────── */
+[data-testid="stAlert"] {
+    background: #150e0e !important;
+    border: 1px solid #3a1a1a !important;
+    border-radius: 10px !important;
+    color: #e0a0a0 !important;
+    font-size: 0.85rem !important;
+}
+
+/* ── SCROLLBAR ───────────────────────────────────────────── */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 4px; }
+</style>
+""", unsafe_allow_html=True)
 
 
-app=g.compile()
+# ── HEADER ────────────────────────────────────────────────────────────────────
 
-def run(topic: str):
-    out = app.invoke(
-        {
-            "topic": topic,
-            "mode": "",
-            "needs_research": False,
-            "queries": [],
-            "evidence": [],
-            "plan": None,
-            "sections": [],
-            "final": "",
-        }
+st.markdown("""
+<div class="bf-header">
+    <div class="bf-wordmark">
+        <div class="bf-logo">B</div>
+        <span class="bf-brand">BlogForge</span>
+    </div>
+    <span class="bf-tagline">LangGraph · Mistral · Tavily</span>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ── HERO ──────────────────────────────────────────────────────────────────────
+
+st.markdown("""
+<div class="bf-hero">
+    <p class="bf-hero-eyebrow">AI-powered technical writing</p>
+    <h1 class="bf-hero-title">From idea to<br>full blog post.</h1>
+    <p class="bf-hero-sub">Enter a topic. The pipeline researches, plans, and writes
+    a complete, structured technical blog — section by section, in parallel.</p>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ── INPUT ─────────────────────────────────────────────────────────────────────
+
+st.markdown('<div class="bf-input-label">Topic</div>', unsafe_allow_html=True)
+
+col_input, col_btn = st.columns([4, 1.4], gap="medium")
+
+with col_input:
+    topic = st.text_input(
+        "Topic",
+        placeholder="e.g. State of Multimodal LLMs in 2026",
+        label_visibility="collapsed",
     )
 
-    return out
+with col_btn:
+    generate = st.button("Generate →")
 
-run("State of Multimodal LLMs in 2026")
+
+# ── PIPELINE ──────────────────────────────────────────────────────────────────
+
+if generate:
+    if not topic.strip():
+        st.error("Enter a topic to continue.")
+    else:
+        try:
+            from main import run
+        except ImportError as exc:
+            st.error(f"Could not import main.py — {exc}")
+            st.stop()
+
+        status_ph = st.empty()
+        status_ph.markdown(
+            '<div class="bf-status"><div class="bf-dot"></div>'
+            'Routing request — deciding research mode…</div>',
+            unsafe_allow_html=True,
+        )
+
+        old_stdout, captured = sys.stdout, io.StringIO()
+        sys.stdout = captured
+        result, error = None, None
+
+        try:
+            status_ph.markdown(
+                '<div class="bf-status"><div class="bf-dot"></div>'
+                'Planning, researching, writing sections in parallel…</div>',
+                unsafe_allow_html=True,
+            )
+            result = run(topic.strip())
+        except Exception as exc:
+            error = exc
+        finally:
+            sys.stdout = old_stdout
+
+        if error:
+            status_ph.empty()
+            st.error(f"Pipeline error: {error}")
+            st.stop()
+
+        status_ph.markdown(
+            '<div class="bf-status"><div class="bf-done-dot"></div>'
+            'Done — blog generated.</div>',
+            unsafe_allow_html=True,
+        )
+
+        plan     = result.get("plan")
+        final_md = result.get("final", "")
+        mode     = result.get("mode", "—").replace("_", " ").title()
+        n_src    = len(result.get("evidence", []))
+        n_sec    = len(plan.tasks) if plan else "—"
+
+        # ── METRICS ───────────────────────────────────────────────────────────
+        st.markdown("<div style='height:1.5rem'></div>", unsafe_allow_html=True)
+        m1, m2, m3, m4 = st.columns(4, gap="small")
+        m1.metric("Sections", n_sec)
+        m2.metric("Mode", mode)
+        m3.metric("Sources", n_src)
+        wc = len(final_md.split())
+        m4.metric("Words", f"~{round(wc / 100) * 100:,}")
+
+        # ── OUTPUT ────────────────────────────────────────────────────────────
+        st.markdown("""
+        <div class="bf-output-header">
+            <span class="bf-output-label">Generated post</span>
+        </div>""", unsafe_allow_html=True)
+
+        tab_render, tab_raw = st.tabs(["Rendered", "Markdown"])
+
+        with tab_render:
+            st.markdown(final_md)
+
+        with tab_raw:
+            st.code(final_md, language="markdown")
+
+        # ── DOWNLOAD ──────────────────────────────────────────────────────────
+        st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+
+        slug = re.sub(r'[^a-z0-9_]', '',
+               (plan.blog_title if plan else topic).lower().replace(" ", "_"))
+        filename = f"{slug}.md"
+
+        st.download_button(
+            label="↓  Download .md",
+            data=final_md.encode("utf-8"),
+            file_name=filename,
+            mime="text/markdown",
+        )
